@@ -124,7 +124,7 @@ jobs:
               --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
               --shape "VM.Standard.A1.Flex" \
               --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
-              --image-id "$OCI_IMAGE_ID" \
+              --source-details "{\"sourceType\": \"image\", \"imageId\": \"$OCI_IMAGE_ID\", \"bootVolumeSizeInGBs\": 200}" \
               --subnet-id "$OCI_SUBNET_ID" \
               --assign-public-ip true \
               --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
