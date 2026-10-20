@@ -10,6 +10,8 @@ on:
 concurrency:
   group: oci-a1-grab
   cancel-in-progress: false
+permissions:
+  contents: write
 
 jobs:
   grab-a1-instance:
@@ -80,6 +82,16 @@ jobs:
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
         run: |
           set +e  # 不因命令失败而退出
+          # 状态上报：把本次抢机结果写入 GRAB_STATUS.md，供外部监控读取（无需登录）
+          STATUS_FILE="$GITHUB_WORKSPACE/GRAB_STATUS.md"
+          write_status() {
+            {
+              echo "# A1 抢机状态"
+              echo ""
+              echo "- 更新时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo "- 结果: $1"
+            } > "$STATUS_FILE"
+          }
 
           TARGET_OCPUS=2
           TARGET_MEMORY=12
@@ -136,11 +148,14 @@ jobs:
               echo "实例创建成功! ID: $INSTANCE_ID"
               echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
               echo "本次创建完成，等待下次运行再扩容。"
+              write_status "✅ 本次新建实例成功，ID: $INSTANCE_ID，配置: ${SCALE_OCPUS[0]}C/${SCALE_MEMORY[0]}G"
               exit 0
             else
               echo "创建失败:"
-              echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT"
+              ERR_MSG=$(echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT")
+              echo "$ERR_MSG"
               echo "下次运行将重试。"
+              write_status "❌ 本次创建失败，下次重试。错误: $ERR_MSG"
               exit 0
             fi
           fi
@@ -171,6 +186,7 @@ jobs:
               echo "实例处于停止状态，启动实例..."
               oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1
             fi
+            write_status "✅ 已有 A1 实例 $INSTANCE_ID（${INSTANCE_STATE}，${CURRENT_OCPUS}C/${CURRENT_MEMORY}G），已达目标配置"
             exit 0
           fi
 
@@ -217,14 +233,35 @@ jobs:
 
           if echo "$UPDATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
             echo "扩容成功! 新配置: ${NEXT_OCPUS}C / ${NEXT_MEMORY}G"
+            SCALE_MSG="扩容成功"
           else
             echo "扩容失败:"
             echo "$UPDATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$UPDATE_RESULT"
+            SCALE_MSG="扩容失败"
           fi
 
           echo "启动实例..."
           oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1
           echo "实例启动命令已发送。"
+          write_status "🔧 实例 $INSTANCE_ID ${SCALE_MSG:-未知}（目标 ${NEXT_OCPUS}C/${NEXT_MEMORY}G），已发送启动命令"
 
           echo "=== 完成 ==="
+          exit 0
+      - name: Publish grab status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          STATUS_FILE="${{ github.workspace }}/GRAB_STATUS.md"
+          [ -f "$STATUS_FILE" ] || exit 0
+          API="https://api.github.com/repos/${{ github.repository }}/contents/GRAB_STATUS.md"
+          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty')
+          CONTENT=$(base64 -w0 "$STATUS_FILE")
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "更新抢机状态 [skip ci]" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
+          else
+            PAYLOAD=$(jq -n --arg m "更新抢机状态 [skip ci]" --arg c "$CONTENT" '{message: $m, content: $c}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
           exit 0
