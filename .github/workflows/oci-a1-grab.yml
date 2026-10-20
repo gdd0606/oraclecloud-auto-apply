@@ -2,8 +2,8 @@ name: OCI A1 Instance Auto Grab
 
 on:
   schedule:
-    # 全天每 15 分钟尝试一次；每次运行只发起一次创建或扩容请求
-    - cron: '*/15 * * * *'
+    # 全天每 20 分钟尝试一次；每次运行只发起一次创建或扩容请求
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 # 避免定时任务延迟后与下一次运行重叠，从而同时向 OCI 发起请求
@@ -74,6 +74,8 @@ jobs:
           oci iam region list --output table
 
       - name: Grab or Scale A1 Instance
+        # 即使前置步骤失败也要运行，保证状态文件不被静默
+        if: always()
         env:
           OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
           OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
@@ -93,6 +95,12 @@ jobs:
             } > "$STATUS_FILE"
           }
 
+          # 前置步骤失败（如 OCI 凭据失效）时也上报，避免静默
+          if ! command -v oci >/dev/null 2>&1 || ! oci iam region list >/dev/null 2>&1; then
+            write_status "❌ OCI CLI 不可用或凭据验证失败，本次未执行抢机"
+            exit 0
+          fi
+
           TARGET_OCPUS=2
           TARGET_MEMORY=12
 
@@ -101,28 +109,32 @@ jobs:
           SCALE_MEMORY=(6 12)
 
           # ============================================
-          # 第一步：查询所有现有 A1 实例（RUNNING / STOPPED）
+          # 第一步：查询所有现有 A1 实例（排除已终止）
           # ============================================
           echo "=== 检查现有 A1 实例 ==="
 
           INSTANCE_ID=""
           INSTANCE_STATE=""
 
-          for STATE_FILTER in RUNNING STOPPED; do
-            RESULT=$(oci compute instance list \
-              --compartment-id "$OCI_COMPARTMENT_ID" \
-              --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
-              --lifecycle-state "$STATE_FILTER" \
-              --query "data[?\"shape\"=='VM.Standard.A1.Flex']" \
-              2>&1)
-            ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
-            if [ -n "$ID" ]; then
-              INSTANCE_ID="$ID"
-              INSTANCE_STATE="$STATE_FILTER"
-              echo "发现 ${STATE_FILTER} 状态的 A1 实例: $INSTANCE_ID"
-              break
-            fi
-          done
+          # 一次查全部；PROVISIONING/STAGING 视为“已有”，避免重复创建
+          RESULT=$(oci compute instance list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --query "data[?shape=='VM.Standard.A1.Flex' && lifecycle-state!='TERMINATED' && lifecycle-state!='TERMINATING']" \
+            2>&1)
+          INSTANCE_ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
+          INSTANCE_STATE=$(echo "$RESULT" | jq -r '.[0]."lifecycle-state" // empty' 2>/dev/null)
+          if [ -n "$INSTANCE_ID" ]; then
+            echo "发现 ${INSTANCE_STATE} 状态的 A1 实例: $INSTANCE_ID"
+          fi
+
+          # 实例还在创建/启动中则跳过，等下次运行
+          case "$INSTANCE_STATE" in
+            PROVISIONING|STAGING|STARTING)
+              write_status "⏳ 实例 $INSTANCE_ID 正在 ${INSTANCE_STATE}，跳过本次操作"
+              exit 0
+              ;;
+          esac
 
           # ============================================
           # 第二步：无实例 → 尝试创建 1C/6G
@@ -168,6 +180,12 @@ jobs:
             --instance-id "$INSTANCE_ID" \
             --query 'data."shape-config"' \
             2>&1)
+
+          # 配置查询失败时直接退出，避免把实例误降级
+          if ! echo "$CURRENT_CONFIG" | jq -e '.ocpus' >/dev/null 2>&1; then
+            write_status "❌ 查询实例 $INSTANCE_ID 当前配置失败，跳过扩容以避免误操作"
+            exit 0
+          fi
 
           CURRENT_OCPUS=$(echo "$CURRENT_CONFIG" | jq -r '.ocpus // 0' 2>/dev/null)
           CURRENT_MEMORY=$(echo "$CURRENT_CONFIG" | jq -r '."memory-in-gbs" // 0' 2>/dev/null)
