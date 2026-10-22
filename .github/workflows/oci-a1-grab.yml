@@ -2,8 +2,8 @@ name: OCI A1 Instance Auto Grab
 
 on:
   schedule:
-    # 全天每 20 分钟尝试一次；每次运行只发起一次创建或扩容请求
-    - cron: '*/20 * * * *'
+    # 全天每 30 分钟尝试一次；每次运行只发起一次创建或扩容请求
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 # 避免定时任务延迟后与下一次运行重叠，从而同时向 OCI 发起请求
