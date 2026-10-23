@@ -1,6 +1,6 @@
 # OCI 账单诊断（只读）
 
-- 生成时间: 2026-10-23 10:01:29 UTC
+- 生成时间: 2026-10-23 10:06:10 UTC
 
 ## 区域订阅与主区域
 - region: ap-osaka-1 home=true status=READY
@@ -18,15 +18,7 @@
 ## 块存储卷清单
 
 ## 最近10天费用（按服务+SKU，每日）
-- 费用查询失败或无权限:
-ServiceError:
-{
-    "client_version": "Oracle-PythonSDK/2.184.1, Oracle-PythonCLI/3.90.2",
-    "code": "InvalidParameter",
-    "logging_tips": "Please run the OCI CLI command using --debug flag to find more debug information.",
-    "message": "Passed UTC date does not have the right precision: hours, minutes, seconds, and second fractions must be 0",
-    "opc-request-id": "D470EA6DD8E54E4EA2F5308DEDBA6C08/4251B844FDEE7BA17F30DB6A4B495881/D7C1AA1AE5C4FEEBC07653CFCF6CADE2",
-    "operation_name": "
+- 10天总费用(computed-amount合计): 0
 
 ## 最近10天费用（按资源汇总）
 - 按资源费用查询失败或无权限
