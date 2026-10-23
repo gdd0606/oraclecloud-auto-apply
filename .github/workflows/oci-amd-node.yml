@@ -121,19 +121,42 @@ jobs:
               return 0
             fi
             new_ingress=$(echo "$ingress" | jq '. + [{"protocol":"6","source":"0.0.0.0/0","is-stateless":false,"tcp-options":{"destination-port-range":{"min":443,"max":443}}}]' 2>/dev/null)
-            oci network security-list update --security-list-id "$sl_id" --ingress-security-rules "$new_ingress" --egress-security-rules "$egress" --force 2>&1 | tail -2
+            oci network security-list update --security-list-id "$sl_id" --ingress-security-rules "$new_ingress" --egress-security-rules "$egress" --force >/tmp/oci-sg.json 2>/tmp/oci-sg.err; cat /tmp/oci-sg.err || true
             echo "已向安全列表追加 443/tcp 入站规则"
           }
 
           # ---------- 第一步：查现有 AMD 微型实例 ----------
           echo "=== 检查现有 E2.1.Micro 实例 ==="
-          RESULT=$(oci compute instance list \
+          oci compute instance list \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
             --query "data[?shape=='VM.Standard.E2.1.Micro' && lifecycle-state!='TERMINATED' && lifecycle-state!='TERMINATING']" \
-            2>&1)
-          INSTANCE_ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
-          INSTANCE_STATE=$(echo "$RESULT" | jq -r '.[0]."lifecycle-state" // empty' 2>/dev/null)
+            > /tmp/instances.json 2>/tmp/oci-list.err
+          echo "list stderr:"; cat /tmp/oci-list.err || true
+          # Keep only clean JSON array sorted by creation time (earliest first)
+          jq 'sort_by(."time-created")' /tmp/instances.json > /tmp/instances-sorted.json 2>/tmp/jq.err || { echo "实例列表解析失败"; cat /tmp/jq.err; write_status "❌ 实例列表解析失败，详见 Actions 日志"; exit 0; }
+          COUNT=$(jq 'length' /tmp/instances-sorted.json)
+          echo "现有 E2.1.Micro 实例数: $COUNT"
+          jq -r '.[] | "instance tail=" + (.id[-6:]) + " state=" + ."lifecycle-state" + " fd=" + ."fault-domain" + " created=" + ."time-created"' /tmp/instances-sorted.json || true
+          # ---- Deduplicate: keep earliest, terminate extras (user approved 2026-10-23) ----
+          if [ "$COUNT" -gt 1 ]; then
+            echo "发现重复实例，保留最早创建的一台，终止其余 $((COUNT-1)) 台"
+            jq -r '.[1:][] | .id' /tmp/instances-sorted.json > /tmp/extra-ids.txt
+            while read -r EXTRA_ID; do
+              [ -n "$EXTRA_ID" ] || continue
+              echo "终止多余实例 tail=${EXTRA_ID: -6}"
+              oci compute instance terminate --instance-id "$EXTRA_ID" --force > /tmp/oci-term.json 2>/tmp/oci-term.err || true
+              cat /tmp/oci-term.err || true
+              for i in $(seq 1 40); do
+                ST=$(oci compute instance get --instance-id "$EXTRA_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+                echo "  等待终止: $ST"
+                if [ "$ST" = "TERMINATED" ] || [ -z "$ST" ]; then break; fi
+                sleep 15
+              done
+            done < /tmp/extra-ids.txt
+          fi
+          INSTANCE_ID=$(jq -r '.[0].id // empty' /tmp/instances-sorted.json 2>/dev/null)
+          INSTANCE_STATE=$(jq -r '.[0]."lifecycle-state" // empty' /tmp/instances-sorted.json 2>/dev/null)
 
           if [ -n "$INSTANCE_ID" ]; then
             echo "已有实例 $INSTANCE_ID 状态 $INSTANCE_STATE"
@@ -143,7 +166,7 @@ jobs:
                 exit 0
                 ;;
               STOPPED)
-                oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1 | tail -1
+                oci compute instance action --instance-id "$INSTANCE_ID" --action START >/tmp/oci-start.json 2>/tmp/oci-start.err; cat /tmp/oci-start.err || true
                 write_status "🔧 AMD 实例 $INSTANCE_ID 已发送启动命令"
                 exit 0
                 ;;
@@ -240,7 +263,7 @@ jobs:
           # ---------- 第四步：创建实例 ----------
           echo "=== 创建 E2.1.Micro 实例 ==="
           METADATA=$(jq -n --arg k1 "$AMD_SSH_PUBLIC_KEY" --arg k2 "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys: ($k1 + "\n" + $k2)}')
-          CREATE_RESULT=$(oci compute instance launch \
+          oci compute instance launch \
             --compartment-id "$OCI_COMPARTMENT_ID" \
             --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
             --shape "VM.Standard.E2.1.Micro" \
@@ -250,10 +273,18 @@ jobs:
             --metadata "$METADATA" \
             --user-data-file "$GITHUB_WORKSPACE/user-data.sh" \
             --display-name "AMD-Node-1" \
-            --wait-for-state RUNNING --max-wait-seconds 900 \
-            2>&1)
-          if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
-            INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
+            > /tmp/create.json 2>/tmp/oci-launch.err
+          echo "launch stderr:"; cat /tmp/oci-launch.err || true
+          CREATE_RESULT=$(cat /tmp/create.json)
+          if jq -e '.data.id' /tmp/create.json > /dev/null 2>&1; then
+            INSTANCE_ID=$(jq -r '.data.id' /tmp/create.json)
+            # Poll until RUNNING (no --wait-for-state, avoids progress lines polluting JSON)
+            for i in $(seq 1 60); do
+              ST=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+              echo "  等待 RUNNING: $ST"
+              if [ "$ST" = "RUNNING" ]; then break; fi
+              sleep 15
+            done
             echo "实例创建成功: $INSTANCE_ID"
             ensure_sg_443
             sleep 10
@@ -261,7 +292,7 @@ jobs:
             write_status "✅ AMD 实例创建成功，ID: $INSTANCE_ID，公网IP: $PIP（节点软件由 cloud-init 自动安装，稍后验证）"
             exit 0
           else
-            ERR_MSG=$(echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT")
+            ERR_MSG=$(jq -r '(.code // "") + " " + (.message // "")' /tmp/create.json 2>/dev/null; cat /tmp/oci-launch.err 2>/dev/null)
             echo "创建失败: $ERR_MSG"
             write_status "❌ AMD 实例创建失败。错误: $ERR_MSG"
             exit 0
