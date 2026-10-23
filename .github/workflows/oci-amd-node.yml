@@ -78,6 +78,7 @@ jobs:
           OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
           SUPPRESS_LABEL_WARNING: "True"
+          AMD_KNOWN_INSTANCE_ID: "ocid1.instance.oc1.ap-osaka-1.anvwsljrsn7dthqcjqgxvzhafaufyc73j2qmwp47bqlnzggh35o5rg4uk37q"
         run: |
           set +e
           STATUS_FILE="$GITHUB_WORKSPACE/AMD_NODE_STATUS.md"
@@ -157,6 +158,16 @@ jobs:
           fi
           INSTANCE_ID=$(jq -r '.[0].id // empty' /tmp/instances-sorted.json 2>/dev/null)
           INSTANCE_STATE=$(jq -r '.[0]."lifecycle-state" // empty' /tmp/instances-sorted.json 2>/dev/null)
+          # 兜底：按已知实例 ID 直查（列表过滤查不到时用）
+          if [ -z "$INSTANCE_ID" ] && [ -n "$AMD_KNOWN_INSTANCE_ID" ]; then
+            GOT=$(oci compute instance get --instance-id "$AMD_KNOWN_INSTANCE_ID" 2>/dev/null | sed -n '/^{/,$p')
+            GST=$(echo "$GOT" | jq -r '.data."lifecycle-state" // empty' 2>/dev/null)
+            if [ -n "$GST" ] && [ "$GST" != "TERMINATED" ] && [ "$GST" != "TERMINATING" ]; then
+              INSTANCE_ID="$AMD_KNOWN_INSTANCE_ID"
+              INSTANCE_STATE="$GST"
+              echo "兜底直查命中实例: $INSTANCE_ID 状态 $INSTANCE_STATE"
+            fi
+          fi
 
           if [ -n "$INSTANCE_ID" ]; then
             echo "已有实例 $INSTANCE_ID 状态 $INSTANCE_STATE"
