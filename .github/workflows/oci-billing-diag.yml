@@ -1,0 +1,129 @@
+name: OCI Billing Diag
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oci-billing-diag
+  cancel-in-progress: false
+permissions:
+  contents: write
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    env:
+      OCI_CLI_VENV: ${{ github.workspace }}/.cache/oci-cli-venv
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      SUPPRESS_LABEL_WARNING: "True"
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache OCI CLI environment
+        id: oci-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OCI_CLI_VENV }}
+          key: oci-cli-venv-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+      - name: Cache pip packages
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-oci-cli-${{ runner.os }}-${{ runner.arch }}-py3.11
+      - name: Install OCI CLI
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv --copies "$OCI_CLI_VENV"
+          "$OCI_CLI_VENV/bin/pip" install --upgrade pip oci-cli
+      - name: Add OCI CLI to PATH
+        run: |
+          echo "$OCI_CLI_VENV/bin" >> "$GITHUB_PATH"
+          "$OCI_CLI_VENV/bin/oci" --version
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+      - name: Collect billing and resource diagnostics (read-only)
+        if: always()
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/BILLING_DIAG.md"
+          {
+            echo "# OCI 账单诊断（只读）"
+            echo ""
+            echo "- 生成时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } > "$OUT"
+          if ! oci iam region list >/dev/null 2>&1; then
+            echo "- ❌ OCI CLI 不可用或凭据验证失败" >> "$OUT"
+            exit 0
+          fi
+          echo "" >> "$OUT"; echo "## 区域订阅与主区域" >> "$OUT"
+          oci iam region-subscription list --tenancy-id "$OCI_CLI_TENANCY" --all > /tmp/regions.json 2>/tmp/e1
+          jq -r '.data[] | "- region: " + ."region-name" + " home=" + (."is-home-region"|tostring) + " status=" + .status' /tmp/regions.json >> "$OUT" 2>/dev/null || { echo "- 查询失败:"; cat /tmp/e1; } >> "$OUT"
+          echo "" >> "$OUT"; echo "## 实例清单（全部形态，含已终止以外的全部状态）" >> "$OUT"
+          oci compute instance list --compartment-id "$OCI_COMPARTMENT_ID" --all > /tmp/inst.json 2>/tmp/e2
+          jq -r '.data[] | "- " + ."display-name" + " | shape=" + .shape + " | state=" + ."lifecycle-state" + " | fd=" + ."fault-domain" + " | created=" + ."time-created" + " | id_tail=" + (.id[-6:]) + " | free_tier_retained=" + ((."system-tags"."orcl-cloud"."free-tier-retained" // "n/a")|tostring)' /tmp/inst.json >> "$OUT" 2>/dev/null || echo "- 实例查询失败，详见日志" >> "$OUT"
+          CNT=$(jq '.data | length' /tmp/inst.json 2>/dev/null); echo "- 实例总数: $CNT" >> "$OUT"
+          echo "" >> "$OUT"; echo "## 启动卷清单（含未挂载的孤儿卷）" >> "$OUT"
+          oci bv boot-volume list --compartment-id "$OCI_COMPARTMENT_ID" --availability-domain "$OCI_AVAILABILITY_DOMAIN" --all > /tmp/bv.json 2>/tmp/e3
+          jq -r '.data[] | "- " + (."display-name" // "?") + " | sizeGB=" + (."size-in-gbs"|tostring) + " | state=" + ."lifecycle-state" + " | created=" + ."time-created" + " | id_tail=" + (.id[-6:])' /tmp/bv.json >> "$OUT" 2>/dev/null || echo "- 启动卷查询失败，详见日志" >> "$OUT"
+          TOT=$(jq '[.data[] | select(."lifecycle-state"!="TERMINATED" and ."lifecycle-state"!="TERMINATING") | ."size-in-gbs"] | add // 0' /tmp/bv.json 2>/dev/null); echo "- 未终止启动卷总容量: ${TOT} GB" >> "$OUT"
+          echo "" >> "$OUT"; echo "## 块存储卷清单" >> "$OUT"
+          oci bv volume list --compartment-id "$OCI_COMPARTMENT_ID" --all > /tmp/vol.json 2>/tmp/e4
+          jq -r '.data[] | "- " + (."display-name" // "?") + " | sizeGB=" + (."size-in-gbs"|tostring) + " | state=" + ."lifecycle-state" + " | id_tail=" + (.id[-6:])' /tmp/vol.json >> "$OUT" 2>/dev/null || echo "- 块卷查询失败或为空" >> "$OUT"
+          echo "" >> "$OUT"; echo "## 最近10天费用（按服务+SKU，每日）" >> "$OUT"
+          START=$(date -u -d '10 days ago' '+%Y-%m-%dT00:00:00Z'); END=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          oci usage-api usage-summary request-summarized-usages --tenant-id "$OCI_CLI_TENANCY" --time-usage-started "$START" --time-usage-ended "$END" --granularity DAILY --group-by '["service","skuName"]' --query-type COST > /tmp/usage1.json 2>/tmp/e5
+          if jq -e '.data.items' /tmp/usage1.json >/dev/null 2>&1; then
+            jq -r '.data.items[] | select(."computed-amount" != null and ."computed-amount" != 0) | "- " + (."time-usage-started"[0:10]) + " | " + .service + " | " + (."sku-name" // "?") + " | amount=" + (."computed-amount"|tostring) + " " + (."currency" // "")' /tmp/usage1.json >> "$OUT"
+            TOTA=$(jq '[.data.items[] | ."computed-amount" // 0] | add' /tmp/usage1.json 2>/dev/null); echo "- 10天总费用(computed-amount合计): $TOTA" >> "$OUT"
+          else
+            echo "- 费用查询失败或无权限:" >> "$OUT"; head -c 500 /tmp/e5 >> "$OUT"; echo "" >> "$OUT"
+          fi
+          echo "" >> "$OUT"; echo "## 最近10天费用（按资源汇总）" >> "$OUT"
+          oci usage-api usage-summary request-summarized-usages --tenant-id "$OCI_CLI_TENANCY" --time-usage-started "$START" --time-usage-ended "$END" --granularity TOTAL --group-by '["resourceId","service","skuName"]' --query-type COST > /tmp/usage2.json 2>/tmp/e6
+          if jq -e '.data.items' /tmp/usage2.json >/dev/null 2>&1; then
+            jq -r '.data.items[] | select(."computed-amount" != null and ."computed-amount" != 0) | "- resource_tail=" + ((."resource-id" // "?")[-6:]) + " | " + .service + " | " + (."sku-name" // "?") + " | amount=" + (."computed-amount"|tostring) + " " + (."currency" // "")' /tmp/usage2.json >> "$OUT"
+          else
+            echo "- 按资源费用查询失败或无权限" >> "$OUT"
+          fi
+          echo "" >> "$OUT"; echo "（完）" >> "$OUT"
+          cat "$OUT"
+      - name: Publish billing diag
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          F="${{ github.workspace }}/BILLING_DIAG.md"
+          [ -f "$F" ] || exit 0
+          API="https://api.github.com/repos/${{ github.repository }}/contents/BILLING_DIAG.md"
+          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty')
+          CONTENT=$(base64 -w0 "$F")
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "账单诊断 [skip ci]" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
+          else
+            PAYLOAD=$(jq -n --arg m "账单诊断 [skip ci]" --arg c "$CONTENT" '{message: $m, content: $c}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
+          exit 0
