@@ -1,0 +1,378 @@
+name: OCI AMD Node Create
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oci-amd-node
+  cancel-in-progress: false
+permissions:
+  contents: write
+
+jobs:
+  create-amd-node:
+    runs-on: ubuntu-latest
+
+    env:
+      OCI_CLI_VENV: ${{ github.workspace }}/.cache/oci-cli-venv
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      # 本节点额外授权的 SSH 公钥（Muse 工作机，用于装机与验证；仅公钥，非机密）
+      AMD_SSH_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEu8ykbciYPcQobEJhcklZ4I/tUcJzS2T81H84LDQIWD hatch"
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache OCI CLI environment
+        id: oci-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OCI_CLI_VENV }}
+          key: oci-cli-venv-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+
+      - name: Cache pip packages
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-oci-cli-${{ runner.os }}-${{ runner.arch }}-py3.11
+
+      - name: Install OCI CLI
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv --copies "$OCI_CLI_VENV"
+          "$OCI_CLI_VENV/bin/pip" install --upgrade pip oci-cli
+
+      - name: Add OCI CLI to PATH
+        run: |
+          echo "$OCI_CLI_VENV/bin" >> "$GITHUB_PATH"
+          "$OCI_CLI_VENV/bin/oci" --version
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+          oci iam region list --output table
+
+      - name: Create AMD micro instance (idempotent)
+        if: always()
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          SUPPRESS_LABEL_WARNING: "True"
+        run: |
+          set +e
+          STATUS_FILE="$GITHUB_WORKSPACE/AMD_NODE_STATUS.md"
+          write_status() {
+            {
+              echo "# AMD 节点状态"
+              echo ""
+              echo "- 更新时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo "- 结果: $1"
+            } > "$STATUS_FILE"
+          }
+
+          if ! command -v oci >/dev/null 2>&1 || ! oci iam region list >/dev/null 2>&1; then
+            write_status "❌ OCI CLI 不可用或凭据验证失败，本次未执行"
+            exit 0
+          fi
+
+          # ---------- 小工具：取实例公网 IP ----------
+          get_ip() {
+            local iid="$1"
+            local vnic
+            vnic=$(oci compute vnic-attachment list --compartment-id "$OCI_COMPARTMENT_ID" --instance-id "$iid" --query 'data[0]."vnic-id"' --raw-output 2>/dev/null)
+            if [ -n "$vnic" ] && [ "$vnic" != "null" ]; then
+              oci network vnic get --vnic-id "$vnic" --query 'data."public-ip"' --raw-output 2>/dev/null
+            fi
+          }
+
+          # ---------- 小工具：确保默认安全列表放行所需 TCP 端口 ----------
+          SGPORTS="未执行"
+          ensure_sg_ports() {
+            local sl_id ingress egress vcn_id p has new_ingress changed verify
+            oci network subnet get --subnet-id "$OCI_SUBNET_ID" > /tmp/subnet.json 2>/tmp/oci-subnet.err
+            echo "subnet get stderr:"; cat /tmp/oci-subnet.err || true
+            sl_id=$(jq -r '.data."default-security-list-id" // empty' /tmp/subnet.json 2>/dev/null)
+            if [ -z "$sl_id" ]; then
+              sl_id=$(jq -r '.data."security-list-ids"[0] // empty' /tmp/subnet.json 2>/dev/null)
+            fi
+            if [ -z "$sl_id" ]; then
+              vcn_id=$(jq -r '.data."vcn-id" // empty' /tmp/subnet.json 2>/dev/null)
+              if [ -n "$vcn_id" ]; then
+                oci network security-list list --compartment-id "$OCI_COMPARTMENT_ID" --vcn-id "$vcn_id" --all > /tmp/sls.json 2>/tmp/oci-sls.err
+                sl_id=$(jq -r '[.data[] | select(."display-name" | test("Default"))][0].id // .data[0].id // empty' /tmp/sls.json 2>/dev/null)
+              fi
+            fi
+            if [ -z "$sl_id" ] || [ "$sl_id" = "null" ]; then
+              echo "SGPORTS_FAILED: 未取到安全列表 ID"
+              SGPORTS="失败(未取到安全列表)"
+              return 0
+            fi
+            echo "安全列表 tail=${sl_id: -6}"
+            oci network security-list get --security-list-id "$sl_id" > /tmp/sl.json 2>/tmp/oci-sl.err
+            ingress=$(jq -c '.data."ingress-security-rules"' /tmp/sl.json 2>/dev/null)
+            egress=$(jq -c '.data."egress-security-rules"' /tmp/sl.json 2>/dev/null)
+            new_ingress="$ingress"
+            changed=0
+            for p in 443 5678 2345 2346 2347 8096 6908; do
+              has=$(echo "$new_ingress" | jq --argjson p "$p" '[.[] | select(.protocol=="6" and .source=="0.0.0.0/0" and (."tcp-options"."destination-port-range".max // 0) >= $p and (."tcp-options"."destination-port-range".min // 65535) <= $p)] | length' 2>/dev/null)
+              if [ "$has" = "0" ] || [ -z "$has" ]; then
+                new_ingress=$(echo "$new_ingress" | jq -c --argjson p "$p" '. + [{"protocol":"6","source":"0.0.0.0/0","is-stateless":false,"tcp-options":{"destination-port-range":{"min":$p,"max":$p}}}]' 2>/dev/null)
+                changed=1
+                echo "待追加端口: $p"
+              else
+                echo "端口 $p 已放行"
+              fi
+            done
+            for p in 443; do
+              has=$(echo "$new_ingress" | jq --argjson p "$p" '[.[] | select(.protocol=="17" and .source=="0.0.0.0/0" and (."udp-options"."destination-port-range".max // 0) >= $p and (."udp-options"."destination-port-range".min // 65535) <= $p)] | length' 2>/dev/null)
+              if [ "$has" = "0" ] || [ -z "$has" ]; then
+                new_ingress=$(echo "$new_ingress" | jq -c --argjson p "$p" '. + [{"protocol":"17","source":"0.0.0.0/0","is-stateless":false,"udp-options":{"destination-port-range":{"min":$p,"max":$p}}}]' 2>/dev/null)
+                changed=1
+                echo "待追加 UDP 端口: $p"
+              else
+                echo "UDP 端口 $p 已放行"
+              fi
+            done
+            # ---- UDP 端口跳跃段 20000-20099 ----
+            has=$(echo "$new_ingress" | jq '[.[] | select(.protocol=="17" and .source=="0.0.0.0/0" and (."udp-options"."destination-port-range".min // 0) <= 20000 and (."udp-options"."destination-port-range".max // 0) >= 20099)] | length' 2>/dev/null)
+            if [ "$has" = "0" ] || [ -z "$has" ]; then
+              new_ingress=$(echo "$new_ingress" | jq -c '. + [{"protocol":"17","source":"0.0.0.0/0","is-stateless":false,"udp-options":{"destination-port-range":{"min":20000,"max":20099}}}]' 2>/dev/null)
+              changed=1
+              echo "待追加 UDP 跳跃段: 20000-20099"
+            else
+              echo "UDP 跳跃段 20000-20099 已放行"
+            fi
+            if [ "$changed" = "1" ]; then
+              oci network security-list update --security-list-id "$sl_id" --ingress-security-rules "$new_ingress" --egress-security-rules "$egress" --force >/tmp/oci-sg.json 2>/tmp/oci-sg.err
+              echo "sg update stderr:"; cat /tmp/oci-sg.err || true
+            else
+              echo "所有端口均已放行，无需修改"
+            fi
+            oci network security-list get --security-list-id "$sl_id" > /tmp/sl2.json 2>/dev/null
+            verify=""
+            for p in 443 5678 2345 2346 2347 8096 6908; do
+              has=$(jq --argjson p "$p" '[.data."ingress-security-rules"[] | select(.protocol=="6" and .source=="0.0.0.0/0" and (."tcp-options"."destination-port-range".max // 0) >= $p and (."tcp-options"."destination-port-range".min // 65535) <= $p)] | length' /tmp/sl2.json 2>/dev/null)
+              if [ "$has" != "0" ] && [ -n "$has" ]; then verify="${verify} ${p}:OK"; else verify="${verify} ${p}:MISSING"; fi
+            done
+            has=$(jq --argjson p 443 '[.data."ingress-security-rules"[] | select(.protocol=="17" and .source=="0.0.0.0/0" and (."udp-options"."destination-port-range".max // 0) >= $p and (."udp-options"."destination-port-range".min // 65535) <= $p)] | length' /tmp/sl2.json 2>/dev/null)
+            if [ "$has" != "0" ] && [ -n "$has" ]; then verify="${verify} udp443:OK"; else verify="${verify} udp443:MISSING"; fi
+            has=$(jq '[.data."ingress-security-rules"[] | select(.protocol=="17" and .source=="0.0.0.0/0" and (."udp-options"."destination-port-range".min // 0) <= 20000 and (."udp-options"."destination-port-range".max // 0) >= 20099)] | length' /tmp/sl2.json 2>/dev/null)
+            if [ "$has" != "0" ] && [ -n "$has" ]; then verify="${verify} udpHop:OK"; else verify="${verify} udpHop:MISSING"; fi
+            echo "SGPORTS_VERIFY:${verify}"
+            if echo "$verify" | grep -q MISSING; then SGPORTS="部分失败(${verify})"; else SGPORTS="全部放行(${verify})"; fi
+            return 0
+          }
+
+          # ---------- 第一步：查现有 AMD 微型实例 ----------
+          echo "=== 检查现有 E2.1.Micro 实例 ==="
+          oci compute instance list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --all \
+            > /tmp/instances-raw.json 2>/tmp/oci-list.err
+          echo "list stderr:"; cat /tmp/oci-list.err || true
+          # Filter locally with jq (avoids JMESPath hyphen-key syntax errors entirely)
+          jq '[.data[] | select(.shape=="VM.Standard.E2.1.Micro" and ."lifecycle-state"!="TERMINATED" and ."lifecycle-state"!="TERMINATING")] | sort_by(."time-created")' /tmp/instances-raw.json > /tmp/instances-sorted.json 2>/tmp/jq.err || { echo "实例列表解析失败"; cat /tmp/jq.err; write_status "❌ 实例列表解析失败，详见 Actions 日志"; exit 0; }
+          if ! jq -e '.data' /tmp/instances-raw.json >/dev/null 2>&1; then echo "实例列表查询失败，终止本次运行（不走新建分支）"; write_status "❌ 实例列表查询失败，详见 Actions 日志"; exit 0; fi
+          COUNT=$(jq 'length' /tmp/instances-sorted.json)
+          echo "现有 E2.1.Micro 实例数: $COUNT"
+          jq -r '.[] | "instance tail=" + (.id[-6:]) + " state=" + ."lifecycle-state" + " fd=" + ."fault-domain" + " created=" + ."time-created"' /tmp/instances-sorted.json || true
+          # ---- Deduplicate: keep earliest, terminate extras (user approved 2026-10-23) ----
+          if [ "$COUNT" -gt 1 ]; then
+            echo "发现重复实例，保留最早创建的一台，终止其余 $((COUNT-1)) 台"
+            jq -r '.[1:][] | .id' /tmp/instances-sorted.json > /tmp/extra-ids.txt
+            while read -r EXTRA_ID; do
+              [ -n "$EXTRA_ID" ] || continue
+              echo "终止多余实例 tail=${EXTRA_ID: -6}"
+              oci compute instance terminate --instance-id "$EXTRA_ID" --force > /tmp/oci-term.json 2>/tmp/oci-term.err || true
+              cat /tmp/oci-term.err || true
+              for i in $(seq 1 40); do
+                ST=$(oci compute instance get --instance-id "$EXTRA_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+                echo "  等待终止: $ST"
+                if [ "$ST" = "TERMINATED" ] || [ -z "$ST" ]; then break; fi
+                sleep 15
+              done
+            done < /tmp/extra-ids.txt
+          fi
+          INSTANCE_ID=$(jq -r '.[0].id // empty' /tmp/instances-sorted.json 2>/dev/null)
+          INSTANCE_STATE=$(jq -r '.[0]."lifecycle-state" // empty' /tmp/instances-sorted.json 2>/dev/null)
+
+          if [ -n "$INSTANCE_ID" ]; then
+            echo "已有实例 $INSTANCE_ID 状态 $INSTANCE_STATE"
+            case "$INSTANCE_STATE" in
+              PROVISIONING|STAGING|STARTING)
+                write_status "⏳ AMD 实例 $INSTANCE_ID 正在 $INSTANCE_STATE"
+                exit 0
+                ;;
+              STOPPED)
+                oci compute instance action --instance-id "$INSTANCE_ID" --action START >/tmp/oci-start.json 2>/tmp/oci-start.err; cat /tmp/oci-start.err || true
+                write_status "🔧 AMD 实例 $INSTANCE_ID 已发送启动命令"
+                exit 0
+                ;;
+              RUNNING)
+                ensure_sg_ports
+                PIP=$(get_ip "$INSTANCE_ID")
+                write_status "✅ AMD 实例已在运行，ID: $INSTANCE_ID，公网IP: $PIP，安全组: ${SGPORTS:-未知}"
+                exit 0
+                ;;
+            esac
+          fi
+
+          # ---------- 第二步：选 x86 Ubuntu 镜像 ----------
+          echo "=== 查询适用于 E2.1.Micro 的最新 Ubuntu 镜像 ==="
+          IMAGE_ID=$(oci compute image list \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            --shape "VM.Standard.E2.1.Micro" \
+            --operating-system "Canonical Ubuntu" \
+            --sort-by TIMECREATED --sort-order DESC \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
+            write_status "❌ 未查到适用于 E2.1.Micro 的 Ubuntu 镜像"
+            exit 0
+          fi
+          echo "镜像: $IMAGE_ID"
+
+          # ---------- 第三步：准备 cloud-init（装 sing-box + VLESS Reality） ----------
+          cat > "$GITHUB_WORKSPACE/user-data.sh" <<'CLOUDINIT'
+          #!/bin/bash
+          exec > /var/log/node-setup.log 2>&1
+          set -x
+          VER=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -oP '"tag_name": "v\K[^"]+' | head -1)
+          if [ -n "$VER" ]; then
+            curl -fsSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+            tar -xzf /tmp/sb.tar.gz -C /tmp
+            install -m 755 /tmp/sing-box-*/sing-box /usr/local/bin/sing-box
+          fi
+          mkdir -p /etc/sing-box
+          UUID=$(/usr/local/bin/sing-box generate uuid)
+          KP=$(/usr/local/bin/sing-box generate reality-keypair)
+          PRIV=$(echo "$KP" | awk '/PrivateKey/{print $2}')
+          PUB=$(echo "$KP" | awk '/PublicKey/{print $2}')
+          SID=$(/usr/local/bin/sing-box generate rand --hex 8)
+          cat > /etc/sing-box/config.json <<EOF2
+          {
+            "log": { "level": "info" },
+            "inbounds": [
+              {
+                "type": "vless",
+                "tag": "vless-in",
+                "listen": "::",
+                "listen_port": 443,
+                "users": [ { "uuid": "$UUID", "flow": "xtls-rprx-vision" } ],
+                "tls": {
+                  "enabled": true,
+                  "server_name": "www.microsoft.com",
+                  "reality": {
+                    "enabled": true,
+                    "handshake": { "server": "www.microsoft.com", "server_port": 443 },
+                    "private_key": "$PRIV",
+                    "short_id": [ "$SID" ]
+                  }
+                }
+              }
+            ],
+            "outbounds": [ { "type": "direct", "tag": "direct" } ]
+          }
+          EOF2
+          /usr/local/bin/sing-box check -c /etc/sing-box/config.json
+          cat > /etc/systemd/system/sing-box.service <<'EOF3'
+          [Unit]
+          Description=sing-box service
+          After=network.target
+          [Service]
+          ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+          Restart=on-failure
+          User=root
+          [Install]
+          WantedBy=multi-user.target
+          EOF3
+          systemctl daemon-reload
+          systemctl enable --now sing-box
+          LINE=$(iptables -L INPUT --line-numbers -n | awk '$2=="REJECT"{print $1; exit}')
+          if [ -n "$LINE" ]; then iptables -I INPUT "$LINE" -p tcp --dport 443 -j ACCEPT; else iptables -A INPUT -p tcp --dport 443 -j ACCEPT; fi
+          if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save; fi
+          PIP=$(curl -s -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/vnics/ | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['publicIp'])" 2>/dev/null)
+          LINK="vless://${UUID}@${PIP}:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&flow=xtls-rprx-vision#AMD-Node-Osaka"
+          echo "$LINK" > /root/vless-link.txt
+          cp /root/vless-link.txt /home/ubuntu/vless-link.txt
+          chown ubuntu:ubuntu /home/ubuntu/vless-link.txt
+          echo "setup done" > /root/node-setup-done.txt
+          CLOUDINIT
+
+          # ---------- 第四步：创建实例 ----------
+          echo "=== 创建 E2.1.Micro 实例 ==="
+          METADATA=$(jq -n --arg k1 "$AMD_SSH_PUBLIC_KEY" --arg k2 "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys: ($k1 + "\n" + $k2)}')
+          oci compute instance launch \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --shape "VM.Standard.E2.1.Micro" \
+            --source-details "{\"sourceType\": \"image\", \"imageId\": \"$IMAGE_ID\", \"bootVolumeSizeInGBs\": 50}" \
+            --subnet-id "$OCI_SUBNET_ID" \
+            --assign-public-ip true \
+            --metadata "$METADATA" \
+            --user-data-file "$GITHUB_WORKSPACE/user-data.sh" \
+            --display-name "AMD-Node-1" \
+            > /tmp/create.json 2>/tmp/oci-launch.err
+          echo "launch stderr:"; cat /tmp/oci-launch.err || true
+          CREATE_RESULT=$(cat /tmp/create.json)
+          if jq -e '.data.id' /tmp/create.json > /dev/null 2>&1; then
+            INSTANCE_ID=$(jq -r '.data.id' /tmp/create.json)
+            # Poll until RUNNING (no --wait-for-state, avoids progress lines polluting JSON)
+            for i in $(seq 1 60); do
+              ST=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+              echo "  等待 RUNNING: $ST"
+              if [ "$ST" = "RUNNING" ]; then break; fi
+              sleep 15
+            done
+            echo "实例创建成功: $INSTANCE_ID"
+            ensure_sg_ports
+            sleep 10
+            PIP=$(get_ip "$INSTANCE_ID")
+            write_status "✅ AMD 实例创建成功，ID: $INSTANCE_ID，公网IP: $PIP，安全组: ${SGPORTS:-未知}（节点软件由 cloud-init 自动安装，稍后验证）"
+            exit 0
+          else
+            ERR_MSG=$(jq -r '(.code // "") + " " + (.message // "")' /tmp/create.json 2>/dev/null; cat /tmp/oci-launch.err 2>/dev/null)
+            echo "创建失败: $ERR_MSG"
+            write_status "❌ AMD 实例创建失败。错误: $ERR_MSG"
+            exit 0
+          fi
+
+      - name: Publish AMD node status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          STATUS_FILE="${{ github.workspace }}/AMD_NODE_STATUS.md"
+          [ -f "$STATUS_FILE" ] || exit 0
+          API="https://api.github.com/repos/${{ github.repository }}/contents/AMD_NODE_STATUS.md"
+          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty')
+          CONTENT=$(base64 -w0 "$STATUS_FILE")
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "更新AMD节点状态 [skip ci]" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
+          else
+            PAYLOAD=$(jq -n --arg m "更新AMD节点状态 [skip ci]" --arg c "$CONTENT" '{message: $m, content: $c}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
+          exit 0
+
