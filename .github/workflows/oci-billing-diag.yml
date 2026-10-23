@@ -92,7 +92,7 @@ jobs:
           oci bv volume list --compartment-id "$OCI_COMPARTMENT_ID" --all > /tmp/vol.json 2>/tmp/e4
           jq -r '.data[] | "- " + (."display-name" // "?") + " | sizeGB=" + (."size-in-gbs"|tostring) + " | state=" + ."lifecycle-state" + " | id_tail=" + (.id[-6:])' /tmp/vol.json >> "$OUT" 2>/dev/null || echo "- 块卷查询失败或为空" >> "$OUT"
           echo "" >> "$OUT"; echo "## 最近10天费用（按服务+SKU，每日）" >> "$OUT"
-          START=$(date -u -d '10 days ago' '+%Y-%m-%dT00:00:00Z'); END=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          START=$(date -u -d '10 days ago' '+%Y-%m-%dT00:00:00Z'); END=$(date -u -d 'tomorrow' '+%Y-%m-%dT00:00:00Z')
           oci usage-api usage-summary request-summarized-usages --tenant-id "$OCI_CLI_TENANCY" --time-usage-started "$START" --time-usage-ended "$END" --granularity DAILY --group-by '["service","skuName"]' --query-type COST > /tmp/usage1.json 2>/tmp/e5
           if jq -e '.data.items' /tmp/usage1.json >/dev/null 2>&1; then
             jq -r '.data.items[] | select(."computed-amount" != null and ."computed-amount" != 0) | "- " + (."time-usage-started"[0:10]) + " | " + .service + " | " + (."sku-name" // "?") + " | amount=" + (."computed-amount"|tostring) + " " + (."currency" // "")' /tmp/usage1.json >> "$OUT"
