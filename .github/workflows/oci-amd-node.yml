@@ -1,0 +1,286 @@
+name: OCI AMD Node Create
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oci-amd-node
+  cancel-in-progress: false
+permissions:
+  contents: write
+
+jobs:
+  create-amd-node:
+    runs-on: ubuntu-latest
+
+    env:
+      OCI_CLI_VENV: ${{ github.workspace }}/.cache/oci-cli-venv
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      # 本节点额外授权的 SSH 公钥（Muse 工作机，用于装机与验证；仅公钥，非机密）
+      AMD_SSH_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEu8ykbciYPcQobEJhcklZ4I/tUcJzS2T81H84LDQIWD hatch"
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache OCI CLI environment
+        id: oci-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OCI_CLI_VENV }}
+          key: oci-cli-venv-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+
+      - name: Cache pip packages
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-oci-cli-${{ runner.os }}-${{ runner.arch }}-py3.11
+
+      - name: Install OCI CLI
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv --copies "$OCI_CLI_VENV"
+          "$OCI_CLI_VENV/bin/pip" install --upgrade pip oci-cli
+
+      - name: Add OCI CLI to PATH
+        run: |
+          echo "$OCI_CLI_VENV/bin" >> "$GITHUB_PATH"
+          "$OCI_CLI_VENV/bin/oci" --version
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+          oci iam region list --output table
+
+      - name: Create AMD micro instance (idempotent)
+        if: always()
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          set +e
+          STATUS_FILE="$GITHUB_WORKSPACE/AMD_NODE_STATUS.md"
+          write_status() {
+            {
+              echo "# AMD 节点状态"
+              echo ""
+              echo "- 更新时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo "- 结果: $1"
+            } > "$STATUS_FILE"
+          }
+
+          if ! command -v oci >/dev/null 2>&1 || ! oci iam region list >/dev/null 2>&1; then
+            write_status "❌ OCI CLI 不可用或凭据验证失败，本次未执行"
+            exit 0
+          fi
+
+          # ---------- 小工具：取实例公网 IP ----------
+          get_ip() {
+            local iid="$1"
+            local vnic
+            vnic=$(oci compute vnic-attachment list --compartment-id "$OCI_COMPARTMENT_ID" --instance-id "$iid" --query 'data[0]."vnic-id"' --raw-output 2>/dev/null)
+            if [ -n "$vnic" ] && [ "$vnic" != "null" ]; then
+              oci network vnic get --vnic-id "$vnic" --query 'data."public-ip"' --raw-output 2>/dev/null
+            fi
+          }
+
+          # ---------- 小工具：确保默认安全列表放行 443/tcp ----------
+          ensure_sg_443() {
+            local sl_id ingress egress has443 new_ingress
+            sl_id=$(oci network subnet get --subnet-id "$OCI_SUBNET_ID" --query 'data."default-security-list-id"' --raw-output 2>/dev/null)
+            if [ -z "$sl_id" ] || [ "$sl_id" = "null" ]; then
+              echo "未取到默认安全列表 ID，跳过安全组设置"
+              return 0
+            fi
+            ingress=$(oci network security-list get --security-list-id "$sl_id" --query 'data."ingress-security-rules"' 2>/dev/null)
+            egress=$(oci network security-list get --security-list-id "$sl_id" --query 'data."egress-security-rules"' 2>/dev/null)
+            has443=$(echo "$ingress" | jq '[.[] | select(.protocol=="6" and .source=="0.0.0.0/0" and (."tcp-options"."destination-port-range".max // 0) >= 443 and (."tcp-options"."destination-port-range".min // 65535) <= 443)] | length' 2>/dev/null)
+            if [ "$has443" != "0" ] && [ -n "$has443" ]; then
+              echo "安全列表已放行 443，无需修改"
+              return 0
+            fi
+            new_ingress=$(echo "$ingress" | jq '. + [{"protocol":"6","source":"0.0.0.0/0","is-stateless":false,"tcp-options":{"destination-port-range":{"min":443,"max":443}}}]' 2>/dev/null)
+            oci network security-list update --security-list-id "$sl_id" --ingress-security-rules "$new_ingress" --egress-security-rules "$egress" --force 2>&1 | tail -2
+            echo "已向安全列表追加 443/tcp 入站规则"
+          }
+
+          # ---------- 第一步：查现有 AMD 微型实例 ----------
+          echo "=== 检查现有 E2.1.Micro 实例 ==="
+          RESULT=$(oci compute instance list \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --query "data[?shape=='VM.Standard.E2.1.Micro' && lifecycle-state!='TERMINATED' && lifecycle-state!='TERMINATING']" \
+            2>&1)
+          INSTANCE_ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
+          INSTANCE_STATE=$(echo "$RESULT" | jq -r '.[0]."lifecycle-state" // empty' 2>/dev/null)
+
+          if [ -n "$INSTANCE_ID" ]; then
+            echo "已有实例 $INSTANCE_ID 状态 $INSTANCE_STATE"
+            case "$INSTANCE_STATE" in
+              PROVISIONING|STAGING|STARTING)
+                write_status "⏳ AMD 实例 $INSTANCE_ID 正在 $INSTANCE_STATE"
+                exit 0
+                ;;
+              STOPPED)
+                oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1 | tail -1
+                write_status "🔧 AMD 实例 $INSTANCE_ID 已发送启动命令"
+                exit 0
+                ;;
+              RUNNING)
+                ensure_sg_443
+                PIP=$(get_ip "$INSTANCE_ID")
+                write_status "✅ AMD 实例已在运行，ID: $INSTANCE_ID，公网IP: $PIP"
+                exit 0
+                ;;
+            esac
+          fi
+
+          # ---------- 第二步：选 x86 Ubuntu 镜像 ----------
+          echo "=== 查询适用于 E2.1.Micro 的最新 Ubuntu 镜像 ==="
+          IMAGE_ID=$(oci compute image list \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            --shape "VM.Standard.E2.1.Micro" \
+            --operating-system "Canonical Ubuntu" \
+            --sort-by TIMECREATED --sort-order DESC \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
+            write_status "❌ 未查到适用于 E2.1.Micro 的 Ubuntu 镜像"
+            exit 0
+          fi
+          echo "镜像: $IMAGE_ID"
+
+          # ---------- 第三步：准备 cloud-init（装 sing-box + VLESS Reality） ----------
+          cat > "$GITHUB_WORKSPACE/user-data.sh" <<'CLOUDINIT'
+          #!/bin/bash
+          exec > /var/log/node-setup.log 2>&1
+          set -x
+          VER=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -oP '"tag_name": "v\K[^"]+' | head -1)
+          if [ -n "$VER" ]; then
+            curl -fsSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+            tar -xzf /tmp/sb.tar.gz -C /tmp
+            install -m 755 /tmp/sing-box-*/sing-box /usr/local/bin/sing-box
+          fi
+          mkdir -p /etc/sing-box
+          UUID=$(/usr/local/bin/sing-box generate uuid)
+          KP=$(/usr/local/bin/sing-box generate reality-keypair)
+          PRIV=$(echo "$KP" | awk '/PrivateKey/{print $2}')
+          PUB=$(echo "$KP" | awk '/PublicKey/{print $2}')
+          SID=$(/usr/local/bin/sing-box generate rand --hex 8)
+          cat > /etc/sing-box/config.json <<EOF2
+          {
+            "log": { "level": "info" },
+            "inbounds": [
+              {
+                "type": "vless",
+                "tag": "vless-in",
+                "listen": "::",
+                "listen_port": 443,
+                "users": [ { "uuid": "$UUID", "flow": "xtls-rprx-vision" } ],
+                "tls": {
+                  "enabled": true,
+                  "server_name": "www.microsoft.com",
+                  "reality": {
+                    "enabled": true,
+                    "handshake": { "server": "www.microsoft.com", "server_port": 443 },
+                    "private_key": "$PRIV",
+                    "short_id": [ "$SID" ]
+                  }
+                }
+              }
+            ],
+            "outbounds": [ { "type": "direct", "tag": "direct" } ]
+          }
+          EOF2
+          /usr/local/bin/sing-box check -c /etc/sing-box/config.json
+          cat > /etc/systemd/system/sing-box.service <<'EOF3'
+          [Unit]
+          Description=sing-box service
+          After=network.target
+          [Service]
+          ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+          Restart=on-failure
+          User=root
+          [Install]
+          WantedBy=multi-user.target
+          EOF3
+          systemctl daemon-reload
+          systemctl enable --now sing-box
+          LINE=$(iptables -L INPUT --line-numbers -n | awk '$2=="REJECT"{print $1; exit}')
+          if [ -n "$LINE" ]; then iptables -I INPUT "$LINE" -p tcp --dport 443 -j ACCEPT; else iptables -A INPUT -p tcp --dport 443 -j ACCEPT; fi
+          if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save; fi
+          PIP=$(curl -s -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/vnics/ | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['publicIp'])" 2>/dev/null)
+          LINK="vless://${UUID}@${PIP}:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&flow=xtls-rprx-vision#AMD-Node-Osaka"
+          echo "$LINK" > /root/vless-link.txt
+          cp /root/vless-link.txt /home/ubuntu/vless-link.txt
+          chown ubuntu:ubuntu /home/ubuntu/vless-link.txt
+          echo "setup done" > /root/node-setup-done.txt
+          CLOUDINIT
+
+          # ---------- 第四步：创建实例 ----------
+          echo "=== 创建 E2.1.Micro 实例 ==="
+          METADATA=$(jq -n --arg k1 "$AMD_SSH_PUBLIC_KEY" --arg k2 "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys: ($k1 + "\n" + $k2)}')
+          CREATE_RESULT=$(oci compute instance launch \
+            --compartment-id "$OCI_COMPARTMENT_ID" \
+            --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+            --shape "VM.Standard.E2.1.Micro" \
+            --source-details "{\"sourceType\": \"image\", \"imageId\": \"$IMAGE_ID\", \"bootVolumeSizeInGBs\": 50}" \
+            --subnet-id "$OCI_SUBNET_ID" \
+            --assign-public-ip true \
+            --metadata "$METADATA" \
+            --user-data-file "$GITHUB_WORKSPACE/user-data.sh" \
+            --display-name "AMD-Node-1" \
+            --wait-for-state RUNNING --max-wait-seconds 900 \
+            2>&1)
+          if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
+            INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
+            echo "实例创建成功: $INSTANCE_ID"
+            ensure_sg_443
+            sleep 10
+            PIP=$(get_ip "$INSTANCE_ID")
+            write_status "✅ AMD 实例创建成功，ID: $INSTANCE_ID，公网IP: $PIP（节点软件由 cloud-init 自动安装，稍后验证）"
+            exit 0
+          else
+            ERR_MSG=$(echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT")
+            echo "创建失败: $ERR_MSG"
+            write_status "❌ AMD 实例创建失败。错误: $ERR_MSG"
+            exit 0
+          fi
+
+      - name: Publish AMD node status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          STATUS_FILE="${{ github.workspace }}/AMD_NODE_STATUS.md"
+          [ -f "$STATUS_FILE" ] || exit 0
+          API="https://api.github.com/repos/${{ github.repository }}/contents/AMD_NODE_STATUS.md"
+          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty')
+          CONTENT=$(base64 -w0 "$STATUS_FILE")
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "更新AMD节点状态 [skip ci]" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
+          else
+            PAYLOAD=$(jq -n --arg m "更新AMD节点状态 [skip ci]" --arg c "$CONTENT" '{message: $m, content: $c}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
+          exit 0
