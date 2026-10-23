@@ -143,6 +143,16 @@ jobs:
                 echo "端口 $p 已放行"
               fi
             done
+            for p in 443; do
+              has=$(echo "$new_ingress" | jq --argjson p "$p" '[.[] | select(.protocol=="17" and .source=="0.0.0.0/0" and (."udp-options"."destination-port-range".max // 0) >= $p and (."udp-options"."destination-port-range".min // 65535) <= $p)] | length' 2>/dev/null)
+              if [ "$has" = "0" ] || [ -z "$has" ]; then
+                new_ingress=$(echo "$new_ingress" | jq -c --argjson p "$p" '. + [{"protocol":"17","source":"0.0.0.0/0","is-stateless":false,"udp-options":{"destination-port-range":{"min":$p,"max":$p}}}]' 2>/dev/null)
+                changed=1
+                echo "待追加 UDP 端口: $p"
+              else
+                echo "UDP 端口 $p 已放行"
+              fi
+            done
             if [ "$changed" = "1" ]; then
               oci network security-list update --security-list-id "$sl_id" --ingress-security-rules "$new_ingress" --egress-security-rules "$egress" --force >/tmp/oci-sg.json 2>/tmp/oci-sg.err
               echo "sg update stderr:"; cat /tmp/oci-sg.err || true
@@ -155,6 +165,8 @@ jobs:
               has=$(jq --argjson p "$p" '[.data."ingress-security-rules"[] | select(.protocol=="6" and .source=="0.0.0.0/0" and (."tcp-options"."destination-port-range".max // 0) >= $p and (."tcp-options"."destination-port-range".min // 65535) <= $p)] | length' /tmp/sl2.json 2>/dev/null)
               if [ "$has" != "0" ] && [ -n "$has" ]; then verify="${verify} ${p}:OK"; else verify="${verify} ${p}:MISSING"; fi
             done
+            has=$(jq --argjson p 443 '[.data."ingress-security-rules"[] | select(.protocol=="17" and .source=="0.0.0.0/0" and (."udp-options"."destination-port-range".max // 0) >= $p and (."udp-options"."destination-port-range".min // 65535) <= $p)] | length' /tmp/sl2.json 2>/dev/null)
+            if [ "$has" != "0" ] && [ -n "$has" ]; then verify="${verify} udp443:OK"; else verify="${verify} udp443:MISSING"; fi
             echo "SGPORTS_VERIFY:${verify}"
             if echo "$verify" | grep -q MISSING; then SGPORTS="部分失败(${verify})"; else SGPORTS="全部放行(${verify})"; fi
             return 0
@@ -352,4 +364,3 @@ jobs:
           fi
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
           exit 0
-
