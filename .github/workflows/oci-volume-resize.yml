@@ -1,0 +1,118 @@
+name: OCI Volume Resize
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oci-volume-resize
+  cancel-in-progress: false
+permissions:
+  contents: write
+
+jobs:
+  resize:
+    runs-on: ubuntu-latest
+    env:
+      OCI_CLI_VENV: ${{ github.workspace }}/.cache/oci-cli-venv
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      SUPPRESS_LABEL_WARNING: "True"
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache OCI CLI environment
+        id: oci-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OCI_CLI_VENV }}
+          key: oci-cli-venv-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+      - name: Cache pip packages
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-oci-cli-${{ runner.os }}-${{ runner.arch }}-py3.11
+      - name: Install OCI CLI
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv --copies "$OCI_CLI_VENV"
+          "$OCI_CLI_VENV/bin/pip" install --upgrade pip oci-cli
+      - name: Add OCI CLI to PATH
+        run: |
+          echo "$OCI_CLI_VENV/bin" >> "$GITHUB_PATH"
+          "$OCI_CLI_VENV/bin/oci" --version
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+      - name: Resize boot volume to 200GB
+        if: always()
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/VOLUME_RESIZE_STATUS.md"
+          {
+            echo "# AMD 启动卷扩容 50GB -> 200GB"
+            echo ""
+            echo "- 执行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } > "$OUT"
+          if ! oci iam region list >/dev/null 2>&1; then
+            echo "- ❌ OCI CLI 不可用或凭据验证失败" >> "$OUT"; exit 0
+          fi
+          oci bv boot-volume list --compartment-id "$OCI_COMPARTMENT_ID" --availability-domain "$OCI_AVAILABILITY_DOMAIN" --all > /tmp/bv.json 2>/tmp/e1
+          if [ $? -ne 0 ]; then echo "- ❌ 启动卷列表查询失败" >> "$OUT"; exit 0; fi
+          BVID=$(jq -r '[.data[] | select(."lifecycle-state"=="AVAILABLE")] | if length==1 then .[0].id else "" end' /tmp/bv.json)
+          if [ -z "$BVID" ]; then echo "- ❌ 未找到唯一的 AVAILABLE 启动卷，已中止" >> "$OUT"; exit 0; fi
+          echo "- 目标启动卷 tail: ${BVID: -6}" >> "$OUT"
+          oci bv boot-volume get --boot-volume-id "$BVID" > /tmp/bvget.json 2>/tmp/e2
+          CUR=$(jq -r '.data."size-in-gbs"' /tmp/bvget.json)
+          echo "- 扩容前容量: ${CUR} GB" >> "$OUT"
+          if [ "$CUR" = "200" ]; then
+            echo "- ✅ 已经是 200GB，无需扩容" >> "$OUT"; exit 0
+          fi
+          oci bv boot-volume update --boot-volume-id "$BVID" --size-in-gbs 200 --wait-for-state AVAILABLE > /tmp/upd.json 2>/tmp/e3
+          RC=$?
+          if [ $RC -ne 0 ]; then
+            echo "- ❌ 扩容命令失败 (rc=$RC):" >> "$OUT"; head -c 600 /tmp/e3 >> "$OUT"; echo "" >> "$OUT"; exit 0
+          fi
+          oci bv boot-volume get --boot-volume-id "$BVID" > /tmp/bvget2.json 2>/tmp/e4
+          NEW=$(jq -r '.data."size-in-gbs"' /tmp/bvget2.json)
+          ST=$(jq -r '.data."lifecycle-state"' /tmp/bvget2.json)
+          echo "- 扩容后容量: ${NEW} GB，状态: ${ST}" >> "$OUT"
+          if [ "$NEW" = "200" ]; then echo "- ✅ 云端扩容完成" >> "$OUT"; else echo "- ⚠️ 扩容后容量不是 200GB，请人工核查" >> "$OUT"; fi
+          exit 0
+      - name: Publish resize status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          F="${{ github.workspace }}/VOLUME_RESIZE_STATUS.md"
+          [ -f "$F" ] || exit 0
+          API="https://api.github.com/repos/${{ github.repository }}/contents/VOLUME_RESIZE_STATUS.md"
+          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty')
+          CONTENT=$(base64 -w0 "$F")
+          if [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n --arg m "AMD 启动卷扩容状态 [skip ci]" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
+          else
+            PAYLOAD=$(jq -n --arg m "AMD 启动卷扩容状态 [skip ci]" --arg c "$CONTENT" '{message: $m, content: $c}')
+          fi
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
+          exit 0
