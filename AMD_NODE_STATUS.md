@@ -1,8 +1,7 @@
 # AMD 节点状态
 
-- 更新时间: 2026-10-23 00:58:40 UTC
-- 结果: ❌ AMD 实例创建失败。错误: Warning: To increase security of your API key located at /home/runner/.oci/oci_api_key.pem, append an extra line with 'OCI_API_KEY' at the end. For more information, refer to https://docs.oracle.com/iaas/Content/API/Concepts/apisigningkey.htm. To suppress the warning, set the env variable SUPPRESS_LABEL_WARNING=True
-Action completed. Waiting until the resource has entered state: ('RUNNING',)
+- 更新时间: 2026-10-23 02:37:05 UTC
+- 结果: ❌ AMD 实例创建失败。错误: Action completed. Waiting until the resource has entered state: ('RUNNING',)
 {
   "data": {
     "agent-config": {
@@ -23,9 +22,9 @@ Action completed. Waiting until the resource has entered state: ('RUNNING',)
     "defined-tags": {},
     "display-name": "AMD-Node-1",
     "extended-metadata": {},
-    "fault-domain": "FAULT-DOMAIN-1",
+    "fault-domain": "FAULT-DOMAIN-3",
     "freeform-tags": {},
-    "id": "ocid1.instance.oc1.ap-osaka-1.anvwsljrsn7dthqcjqgxvzhafaufyc73j2qmwp47bqlnzggh35o5rg4uk37q",
+    "id": "ocid1.instance.oc1.ap-osaka-1.anvwsljrsn7dthqcxajbqah2vtqcs745b32pzwsb2uz63bkayepi2xzgam7a",
     "image-id": "ocid1.image.oc1.ap-osaka-1.aaaaaaaasbz4b7rawtq65nvs6gfroopawocwyth7w4scs5vhr44md4px6txq",
     "instance-configuration-id": null,
     "instance-options": {
@@ -85,8 +84,8 @@ Action completed. Waiting until the resource has entered state: ('RUNNING',)
         "free-tier-retained": "true"
       }
     },
-    "time-created": "2026-10-23T00:57:34.693000+00:00",
+    "time-created": "2026-10-23T02:35:59.450000+00:00",
     "time-maintenance-reboot-due": null
   },
-  "etag": "38681ff8ad12958f926a2388ae17a25feb39059f45528768191c785f82aeed3b"
+  "etag": "80e4b66a63f15507933497a01a860e3a8fec9cdbfd01ef2710617751b985f8aa"
 }
