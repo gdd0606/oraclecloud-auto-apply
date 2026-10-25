@@ -1,5 +1,13 @@
 name: OCI A1 Instance Auto Grab
 
+# Always Free 范围（Oracle 官方文档，2026 年现行口径）：
+# - Ampere A1 总量上限：2 OCPU / 12 GB（每月 1500 OCPU 小时 + 9000 GB 小时），
+#   超过会被停用、30 天后删除。注意：4 OCPU / 24 GB 是旧口径，已下调，不可再用。
+# - 启动盘：官方最小/默认 47 GB；块存储免费总额 200 GB。
+#   本脚本 A1 启动盘取 100 GB：现有 AMD 节点占 50 GB，合计 150 GB，留 50 GB 余量。
+# - AMD 微型实例另计：最多 2 台 VM.Standard.E2.1.Micro。
+# - 公网 IP 用临时（ephemeral）IP，不要用预留 IP（收费）。
+
 on:
   schedule:
     # 全天每 30 分钟尝试一次；每次运行只发起一次创建或扩容请求
@@ -101,10 +109,11 @@ jobs:
             exit 0
           fi
 
+          # 目标配置 = Always Free 上限（2C/12G），不可改为 4C/24G（旧口径，已下调）
           TARGET_OCPUS=2
           TARGET_MEMORY=12
 
-          # 扩容路径定义
+          # 扩容路径定义：先抢 1C/6G（容易抢到），再扩到免费上限 2C/12G
           SCALE_OCPUS=(1 2)
           SCALE_MEMORY=(6 12)
 
@@ -143,12 +152,14 @@ jobs:
             echo "=== 无现有 A1 实例，尝试创建 ==="
             echo "尝试创建 ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G 实例..."
 
+            # 启动盘 100GB：AMD 50GB + A1 100GB = 150GB，留 50GB 余量；
+            # 200GB 会占满 200GB 免费块存储额度，与 AMD 合计 250GB，必报 QuotaExceeded（2026-10-23 已踩过）
             CREATE_RESULT=$(oci compute instance launch \
               --compartment-id "$OCI_COMPARTMENT_ID" \
               --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
               --shape "VM.Standard.A1.Flex" \
               --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
-              --source-details "{\"sourceType\": \"image\", \"imageId\": \"$OCI_IMAGE_ID\", \"bootVolumeSizeInGBs\": 200}" \
+              --source-details "{\"sourceType\": \"image\", \"imageId\": \"$OCI_IMAGE_ID\", \"bootVolumeSizeInGBs\": 100}" \
               --subnet-id "$OCI_SUBNET_ID" \
               --assign-public-ip true \
               --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
