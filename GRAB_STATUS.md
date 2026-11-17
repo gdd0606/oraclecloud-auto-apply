@@ -1,6 +1,6 @@
 # A1 抢机状态
 
-- 更新时间: 2026-11-17 10:59:50 UTC
+- 更新时间: 2026-11-17 19:45:04 UTC
 - 结果: ❌ 本次创建失败，下次重试。错误: Warning: To increase security of your API key located at /home/runner/.oci/oci_api_key.pem, append an extra line with 'OCI_API_KEY' at the end. For more information, refer to https://docs.oracle.com/iaas/Content/API/Concepts/apisigningkey.htm. To suppress the warning, set the env variable SUPPRESS_LABEL_WARNING=True
 ServiceError:
 {
@@ -8,11 +8,11 @@ ServiceError:
     "code": "TooManyRequests",
     "logging_tips": "Please run the OCI CLI command using --debug flag to find more debug information.",
     "message": "Too many requests for the user",
-    "opc-request-id": "DA4F2E3321414B11A0F5A915201CAC69/D8CBEFE4ACBD0BD4A633FC6A4B4958B9/215E99A3198247C1445EF0573D19CFE3",
+    "opc-request-id": "86AAE845728745CAAFFD763C96F07E41/F7423B1CBFF96259C0AEFC6A4B4958E2/2D28AEEEE1424E9592E876FFB2FF7721",
     "operation_name": "launch_instance",
     "request_endpoint": "POST https://iaas.ap-osaka-1.oraclecloud.com/20160918/instances",
     "status": 429,
     "target_service": "compute",
-    "timestamp": "2026-11-17T10:59:50.668170+00:00",
+    "timestamp": "2026-11-17T19:45:04.822152+00:00",
     "troubleshooting_tips": "See [https://docs.oracle.com/iaas/Content/API/References/apierrors.htm] for more information about resolving this error. If you are unable to resolve this issue, run this CLI command with --debug option and contact Oracle support and provide them the full error message."
 }
