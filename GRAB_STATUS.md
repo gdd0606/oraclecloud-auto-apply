@@ -1,6 +1,6 @@
 # A1 抢机状态
 
-- 更新时间: 2026-11-19 09:11:53 UTC
+- 更新时间: 2026-11-19 18:32:24 UTC
 - 结果: ❌ 本次创建失败，下次重试。错误: Warning: To increase security of your API key located at /home/runner/.oci/oci_api_key.pem, append an extra line with 'OCI_API_KEY' at the end. For more information, refer to https://docs.oracle.com/iaas/Content/API/Concepts/apisigningkey.htm. To suppress the warning, set the env variable SUPPRESS_LABEL_WARNING=True
 ServiceError:
 {
@@ -8,11 +8,11 @@ ServiceError:
     "code": "InternalError",
     "logging_tips": "Please run the OCI CLI command using --debug flag to find more debug information.",
     "message": "Out of host capacity.",
-    "opc-request-id": "DE6B497D3F694E6C8AF78818B6C8CC8A/546D85045E94E82B58BDFE6A4B495877/0FFA15CBE66C364CD3FB462CF72765D9",
+    "opc-request-id": "06A2B1BC02464F32805C4BAC2CC20625/94FF03E98DB2CE57B740FF6A4B4958E5/D1ED6194E189F1A762047E678437380C",
     "operation_name": "launch_instance",
     "request_endpoint": "POST https://iaas.ap-osaka-1.oraclecloud.com/20160918/instances",
     "status": 500,
     "target_service": "compute",
-    "timestamp": "2026-11-19T09:11:53.392406+00:00",
+    "timestamp": "2026-11-19T18:32:24.131736+00:00",
     "troubleshooting_tips": "See [https://docs.oracle.com/iaas/Content/API/References/apierrors.htm] for more information about resolving this error. If you are unable to resolve this issue, run this CLI command with --debug option and contact Oracle support and provide them the full error message."
 }
