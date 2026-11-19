@@ -90,6 +90,7 @@ jobs:
           OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
           OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e  # 不因命令失败而退出
           # 状态上报：把本次抢机结果写入 GRAB_STATUS.md，供外部监控读取（无需登录）
@@ -100,8 +101,89 @@ jobs:
               echo ""
               echo "- 更新时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
               echo "- 结果: $1"
+              if [ "${BACKOFF_UNTIL:-0}" -gt "$(date -u +%s)" ] 2>/dev/null; then
+                echo "- 退避: $BACKOFF_NOTE"
+              fi
             } > "$STATUS_FILE"
           }
+
+          # === BACKOFF-LOGIC-BEGIN ===
+          # 429 限流退避：状态存 GRAB_BACKOFF.json（随状态一起回写仓库，跨运行有效）。
+          # 规则：遇到 429 → 退避 2 小时，再犯翻倍（4h、8h），上限 8 小时；退避窗口内
+          # 直接跳过、不对甲骨文发任何调用；任何非 429 结果都清除退避。
+          # 容量不足（Out of host capacity）不是限流，不退避，仍按原 30 分钟节奏重试。
+          BACKOFF_FILE="$GITHUB_WORKSPACE/GRAB_BACKOFF.json"
+          BACKOFF_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/GRAB_BACKOFF.json"
+          NOW_EPOCH=${NOW_EPOCH:-$(date -u +%s)}
+          BACKOFF_UNTIL=0
+          BACKOFF_COUNT=0
+          BACKOFF_NOTE=""
+
+          backoff_save() {
+            if [ "${BACKOFF_UNTIL:-0}" -gt 0 ] 2>/dev/null; then
+              local until_cst
+              until_cst=$(TZ=Asia/Shanghai date -d "@$BACKOFF_UNTIL" '+%Y-%m-%d %H:%M')
+              BACKOFF_NOTE="限流退避中：连续第 ${BACKOFF_COUNT} 次 429，本次退避至 ${until_cst}（北京时间）后恢复重试，退避期间不向甲骨文发请求"
+            else
+              BACKOFF_NOTE=""
+            fi
+            jq -n --argjson until "${BACKOFF_UNTIL:-0}" --argjson count "${BACKOFF_COUNT:-0}" \
+              --arg note "$BACKOFF_NOTE" --arg updated "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+              '{backoff_until_epoch: $until, consecutive_429: $count, note: $note, updated_utc: $updated}' \
+              > "$BACKOFF_FILE"
+          }
+
+          backoff_load() {
+            BACKOFF_UNTIL=0; BACKOFF_COUNT=0; BACKOFF_NOTE=""
+            if [ -s "$BACKOFF_FILE" ]; then
+              BACKOFF_UNTIL=$(jq -r '.backoff_until_epoch // 0' "$BACKOFF_FILE" 2>/dev/null || echo 0)
+              BACKOFF_COUNT=$(jq -r '.consecutive_429 // 0' "$BACKOFF_FILE" 2>/dev/null || echo 0)
+              BACKOFF_NOTE=$(jq -r '.note // ""' "$BACKOFF_FILE" 2>/dev/null || echo "")
+            fi
+          }
+
+          # 判定一段 OCI 输出是否为 429 限流（容量不足的 status 是 500，不会命中）
+          is_rate_limited() {
+            echo "$1" | grep -Eq '"status": *429|TooManyRequests'
+          }
+
+          # 记一次 429：递进延长退避（2h → 4h → 8h 上限）
+          backoff_bump() {
+            BACKOFF_COUNT=$(( ${BACKOFF_COUNT:-0} + 1 ))
+            local hours=2
+            if [ "$BACKOFF_COUNT" -eq 2 ]; then hours=4;
+            elif [ "$BACKOFF_COUNT" -ge 3 ]; then hours=8; fi
+            BACKOFF_UNTIL=$(( NOW_EPOCH + hours * 3600 ))
+            backoff_save
+            echo "触发限流退避：连续第 ${BACKOFF_COUNT} 次 429，退避 ${hours} 小时"
+          }
+
+          # 非 429 结果：清除退避
+          backoff_clear() {
+            if [ "${BACKOFF_UNTIL:-0}" -gt 0 ] || [ "${BACKOFF_COUNT:-0}" -gt 0 ]; then
+              BACKOFF_UNTIL=0; BACKOFF_COUNT=0; BACKOFF_NOTE=""
+              backoff_save
+            fi
+          }
+
+          # 是否处于退避窗口（主流程据此决定跳过还是尝试）
+          backoff_active() {
+            [ "${BACKOFF_UNTIL:-0}" -gt "$NOW_EPOCH" ]
+          }
+          # === BACKOFF-LOGIC-END ===
+
+          # 取回上次运行留下的退避状态（经 Contents API 读取；本地已有同名文件时直接用）
+          if [ ! -s "$BACKOFF_FILE" ] && [ -n "${GH_TOKEN:-}" ]; then
+            curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$BACKOFF_API" \
+              | jq -r '.content // empty' | tr -d '\n' | base64 -d > "$BACKOFF_FILE" 2>/dev/null || true
+          fi
+          backoff_load
+
+          # 退避窗口内：只更新状态说明就结束，不对甲骨文发任何调用
+          if backoff_active; then
+            write_status "⏸️ 限流退避中，本次跳过抢机（未向甲骨文发请求）。$BACKOFF_NOTE"
+            exit 0
+          fi
 
           # 前置步骤失败（如 OCI 凭据失效）时也上报，避免静默
           if ! command -v oci >/dev/null 2>&1 || ! oci iam region list >/dev/null 2>&1; then
@@ -133,6 +215,13 @@ jobs:
             2>&1)
           INSTANCE_ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
           INSTANCE_STATE=$(echo "$RESULT" | jq -r '.[0]."lifecycle-state" // empty' 2>/dev/null)
+
+          # 查询被限流：进入退避，本次结束（不继续发创建请求）
+          if is_rate_limited "$RESULT"; then
+            backoff_bump
+            write_status "❌ 查询实例时被甲骨文限流（429），已进入退避。$BACKOFF_NOTE"
+            exit 0
+          fi
           if [ -n "$INSTANCE_ID" ]; then
             echo "发现 ${INSTANCE_STATE} 状态的 A1 实例: $INSTANCE_ID"
           fi
@@ -140,6 +229,7 @@ jobs:
           # 实例还在创建/启动中则跳过，等下次运行
           case "$INSTANCE_STATE" in
             PROVISIONING|STAGING|STARTING)
+              backoff_clear
               write_status "⏳ 实例 $INSTANCE_ID 正在 ${INSTANCE_STATE}，跳过本次操作"
               exit 0
               ;;
@@ -171,6 +261,7 @@ jobs:
               echo "实例创建成功! ID: $INSTANCE_ID"
               echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
               echo "本次创建完成，等待下次运行再扩容。"
+              backoff_clear
               write_status "✅ 本次新建实例成功，ID: $INSTANCE_ID，配置: ${SCALE_OCPUS[0]}C/${SCALE_MEMORY[0]}G"
               exit 0
             else
@@ -178,7 +269,13 @@ jobs:
               ERR_MSG=$(echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT")
               echo "$ERR_MSG"
               echo "下次运行将重试。"
-              write_status "❌ 本次创建失败，下次重试。错误: $ERR_MSG"
+              if is_rate_limited "$CREATE_RESULT"; then
+                backoff_bump
+                write_status "❌ 本次创建被甲骨文限流（429），已进入退避，退避结束后恢复重试。错误: $ERR_MSG"
+              else
+                backoff_clear
+                write_status "❌ 本次创建失败，下次重试。错误: $ERR_MSG"
+              fi
               exit 0
             fi
           fi
@@ -194,7 +291,12 @@ jobs:
 
           # 配置查询失败时直接退出，避免把实例误降级
           if ! echo "$CURRENT_CONFIG" | jq -e '.ocpus' >/dev/null 2>&1; then
-            write_status "❌ 查询实例 $INSTANCE_ID 当前配置失败，跳过扩容以避免误操作"
+            if is_rate_limited "$CURRENT_CONFIG"; then
+              backoff_bump
+              write_status "❌ 查询实例 $INSTANCE_ID 配置时被限流（429），已进入退避。$BACKOFF_NOTE"
+            else
+              write_status "❌ 查询实例 $INSTANCE_ID 当前配置失败，跳过扩容以避免误操作"
+            fi
             exit 0
           fi
 
@@ -215,6 +317,7 @@ jobs:
               echo "实例处于停止状态，启动实例..."
               oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1
             fi
+            backoff_clear
             write_status "✅ 已有 A1 实例 $INSTANCE_ID（${INSTANCE_STATE}，${CURRENT_OCPUS}C/${CURRENT_MEMORY}G），已达目标配置"
             exit 0
           fi
@@ -262,11 +365,18 @@ jobs:
 
           if echo "$UPDATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
             echo "扩容成功! 新配置: ${NEXT_OCPUS}C / ${NEXT_MEMORY}G"
+            backoff_clear
             SCALE_MSG="扩容成功"
           else
             echo "扩容失败:"
             echo "$UPDATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$UPDATE_RESULT"
-            SCALE_MSG="扩容失败"
+            if is_rate_limited "$UPDATE_RESULT"; then
+              backoff_bump
+              SCALE_MSG="扩容失败（限流 429，已进入退避）"
+            else
+              backoff_clear
+              SCALE_MSG="扩容失败"
+            fi
           fi
 
           echo "启动实例..."
@@ -282,15 +392,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          STATUS_FILE="${{ github.workspace }}/GRAB_STATUS.md"
-          [ -f "$STATUS_FILE" ] || exit 0
-          API="https://api.github.com/repos/${{ github.repository }}/contents/GRAB_STATUS.md"
-          SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | jq -r '.sha // empty')
-          CONTENT=$(base64 -w0 "$STATUS_FILE")
-          if [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg m "更新抢机状态 [skip ci]" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
-          else
-            PAYLOAD=$(jq -n --arg m "更新抢机状态 [skip ci]" --arg c "$CONTENT" '{message: $m, content: $c}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
+          # 抢机状态与限流退避状态一起回写仓库；内容未变化的文件跳过，避免无意义提交
+          for NAME in GRAB_STATUS.md GRAB_BACKOFF.json; do
+            STATUS_FILE="${{ github.workspace }}/$NAME"
+            [ -f "$STATUS_FILE" ] || continue
+            API="https://api.github.com/repos/${{ github.repository }}/contents/$NAME"
+            REMOTE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API")
+            SHA=$(echo "$REMOTE" | jq -r '.sha // empty')
+            CONTENT=$(base64 -w0 "$STATUS_FILE")
+            REMOTE_CONTENT=$(echo "$REMOTE" | jq -r '.content // empty' | tr -d '\n')
+            if [ -n "$SHA" ] && [ "$REMOTE_CONTENT" = "$CONTENT" ]; then
+              echo "$NAME 未变化，跳过回写"
+              continue
+            fi
+            MSG="更新抢机状态 [skip ci]"
+            if [ "$NAME" = "GRAB_BACKOFF.json" ]; then MSG="更新限流退避状态 [skip ci]"; fi
+            if [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg m "$MSG" --arg c "$CONTENT" --arg s "$SHA" '{message: $m, content: $c, sha: $s}')
+            else
+              PAYLOAD=$(jq -n --arg m "$MSG" --arg c "$CONTENT" '{message: $m, content: $c}')
+            fi
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$PAYLOAD" "$API" | jq -r '.commit.sha // .message' || true
+          done
           exit 0
