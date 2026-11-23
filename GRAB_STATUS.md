@@ -1,18 +1,19 @@
 # A1 抢机状态
 
-- 更新时间: 2026-11-22 21:38:44 UTC
-- 结果: ❌ 本次创建失败，下次重试。错误: Warning: To increase security of your API key located at /home/runner/.oci/oci_api_key.pem, append an extra line with 'OCI_API_KEY' at the end. For more information, refer to https://docs.oracle.com/iaas/Content/API/Concepts/apisigningkey.htm. To suppress the warning, set the env variable SUPPRESS_LABEL_WARNING=True
+- 更新时间: 2026-11-23 02:18:06 UTC
+- 结果: ❌ 本次创建被甲骨文限流（429），已进入退避，退避结束后恢复重试。错误: Warning: To increase security of your API key located at /home/runner/.oci/oci_api_key.pem, append an extra line with 'OCI_API_KEY' at the end. For more information, refer to https://docs.oracle.com/iaas/Content/API/Concepts/apisigningkey.htm. To suppress the warning, set the env variable SUPPRESS_LABEL_WARNING=True
 ServiceError:
 {
     "client_version": "Oracle-PythonSDK/2.184.1, Oracle-PythonCLI/3.90.2",
-    "code": "InternalError",
+    "code": "TooManyRequests",
     "logging_tips": "Please run the OCI CLI command using --debug flag to find more debug information.",
-    "message": "Out of host capacity.",
-    "opc-request-id": "473DFEB6956B4C72B01EBBEA00836F38/AABAE0AF25A02520E360036B4B495843/87C4192BA56FC89B811374B484D7AFDE",
+    "message": "Too many requests for the tenant",
+    "opc-request-id": "18C0D523191A4BA9935849FEA2A5CE4F/7C1B8C38EC8D8F065EA2036B4B495874/34C0DAF5422BCDF3E055FB3586CDC46F",
     "operation_name": "launch_instance",
     "request_endpoint": "POST https://iaas.ap-osaka-1.oraclecloud.com/20160918/instances",
-    "status": 500,
+    "status": 429,
     "target_service": "compute",
-    "timestamp": "2026-11-22T21:38:44.365928+00:00",
+    "timestamp": "2026-11-23T02:18:06.222563+00:00",
     "troubleshooting_tips": "See [https://docs.oracle.com/iaas/Content/API/References/apierrors.htm] for more information about resolving this error. If you are unable to resolve this issue, run this CLI command with --debug option and contact Oracle support and provide them the full error message."
 }
+- 退避: 限流退避中：连续第 1 次 429，本次退避至 2026-11-23 12:16（北京时间）后恢复重试，退避期间不向甲骨文发请求
