@@ -1,6 +1,6 @@
 {
-  "backoff_until_epoch": 0,
-  "consecutive_429": 0,
-  "note": "",
-  "updated_utc": "2026-11-24 18:41:29 UTC"
+  "backoff_until_epoch": 1795582573,
+  "consecutive_429": 1,
+  "note": "限流退避中：连续第 1 次 429，本次退避至 2026-11-25 12:56（北京时间）后恢复重试，退避期间不向甲骨文发请求",
+  "updated_utc": "2026-11-25 02:57:59 UTC"
 }
